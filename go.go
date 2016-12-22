@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"text/template"
 )
@@ -18,27 +20,53 @@ type OutputTemplateData struct {
 	Arch string
 }
 
+type CompileOpts struct {
+	PackagePath string
+	Platform    Platform
+	OutputTpl   string
+	Ldflags     string
+	Gcflags     string
+	Tags        string
+	Cgo         bool
+	Rebuild     bool
+	GoCmd       string
+}
+
 // GoCrossCompile
-func GoCrossCompile(packagePath string, platform Platform, outputTpl string, ldflags string, tags string) error {
+func GoCrossCompile(opts *CompileOpts) error {
 	env := append(os.Environ(),
-		"GOOS="+platform.OS,
-		"GOARCH="+platform.Arch)
+		"GOOS="+opts.Platform.OS,
+		"GOARCH="+opts.Platform.Arch)
+
+	// If we're building for our own platform, then enable cgo always. We
+	// respect the CGO_ENABLED flag if that is explicitly set on the platform.
+	if !opts.Cgo && os.Getenv("CGO_ENABLED") != "0" {
+		opts.Cgo = runtime.GOOS == opts.Platform.OS &&
+			runtime.GOARCH == opts.Platform.Arch
+	}
+
+	// If cgo is enabled then set that env var
+	if opts.Cgo {
+		env = append(env, "CGO_ENABLED=1")
+	} else {
+		env = append(env, "CGO_ENABLED=0")
+	}
 
 	var outputPath bytes.Buffer
-	tpl, err := template.New("output").Parse(outputTpl)
+	tpl, err := template.New("output").Parse(opts.OutputTpl)
 	if err != nil {
 		return err
 	}
 	tplData := OutputTemplateData{
-		Dir:  filepath.Base(packagePath),
-		OS:   platform.OS,
-		Arch: platform.Arch,
+		Dir:  filepath.Base(opts.PackagePath),
+		OS:   opts.Platform.OS,
+		Arch: opts.Platform.Arch,
 	}
 	if err := tpl.Execute(&outputPath, &tplData); err != nil {
 		return err
 	}
 
-	if platform.OS == "windows" {
+	if opts.Platform.OS == "windows" {
 		outputPath.WriteString(".exe")
 	}
 
@@ -54,28 +82,50 @@ func GoCrossCompile(packagePath string, platform Platform, outputTpl string, ldf
 	// the GOPATH.For this, we just drop it since we move to that
 	// directory to build.
 	chdir := ""
-	if packagePath[0] == '_' {
-		chdir = packagePath[1:]
-		packagePath = ""
+	if opts.PackagePath[0] == '_' {
+		if runtime.GOOS == "windows" {
+			// We have to replace weird paths like this:
+			//
+			//   _/c_/Users
+			//
+			// With:
+			//
+			//   c:\Users
+			//
+			re := regexp.MustCompile("^/([a-zA-Z])_/")
+			chdir = re.ReplaceAllString(opts.PackagePath[1:], "$1:\\")
+			chdir = strings.Replace(chdir, "/", "\\", -1)
+		} else {
+			chdir = opts.PackagePath[1:]
+		}
+
+		opts.PackagePath = ""
 	}
 
-	_, err = execGo(env, chdir, "build",
-		"-ldflags", ldflags,
-		"-tags", tags,
+	args := []string{"build"}
+	if opts.Rebuild {
+		args = append(args, "-a")
+	}
+	args = append(args,
+		"-gcflags", opts.Gcflags,
+		"-ldflags", opts.Ldflags,
+		"-tags", opts.Tags,
 		"-o", outputPathReal,
-		packagePath)
+		opts.PackagePath)
+
+	_, err = execGo(opts.GoCmd, env, chdir, args...)
 	return err
 }
 
 // GoMainDirs returns the file paths to the packages that are "main"
 // packages, from the list of packages given. The list of packages can
 // include relative paths, the special "..." Go keyword, etc.
-func GoMainDirs(packages []string) ([]string, error) {
+func GoMainDirs(packages []string, GoCmd string) ([]string, error) {
 	args := make([]string, 0, len(packages)+3)
 	args = append(args, "list", "-f", "{{.Name}}|{{.ImportPath}}")
 	args = append(args, packages...)
 
-	output, err := execGo(nil, "", args...)
+	output, err := execGo(GoCmd, nil, "", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +152,7 @@ func GoMainDirs(packages []string) ([]string, error) {
 
 // GoRoot returns the GOROOT value for the compiled `go` binary.
 func GoRoot() (string, error) {
-	output, err := execGo(nil, "", "env", "GOROOT")
+	output, err := execGo("go", nil, "", "env", "GOROOT")
 	if err != nil {
 		return "", err
 	}
@@ -131,12 +181,24 @@ func GoVersion() (string, error) {
 	}
 
 	// Execute and read the version, which will be the only thing on stdout.
-	return execGo(nil, "", "run", sourcePath)
+	return execGo("go", nil, "", "run", sourcePath)
 }
 
-func execGo(env []string, dir string, args ...string) (string, error) {
+// GoVersionParts parses the version numbers from the version itself
+// into major and minor: 1.5, 1.4, etc.
+func GoVersionParts() (result [2]int, err error) {
+	version, err := GoVersion()
+	if err != nil {
+		return
+	}
+
+	_, err = fmt.Sscanf(version, "go%d.%d", &result[0], &result[1])
+	return
+}
+
+func execGo(GoCmd string, env []string, dir string, args ...string) (string, error) {
 	var stderr, stdout bytes.Buffer
-	cmd := exec.Command("go", args...)
+	cmd := exec.Command(GoCmd, args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if env != nil {

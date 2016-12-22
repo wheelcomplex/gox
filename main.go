@@ -23,6 +23,9 @@ func realMain() int {
 	var platformFlag PlatformFlag
 	var tags string
 	var verbose bool
+	var flagGcflags string
+	var flagCgo, flagRebuild, flagListOSArch bool
+	var flagGoCmd string
 	flags := flag.NewFlagSet("gox", flag.ExitOnError)
 	flags.Usage = func() { printUsage() }
 	flags.Var(platformFlag.ArchFlagValue(), "arch", "arch to build for or skip")
@@ -34,23 +37,42 @@ func realMain() int {
 	flags.IntVar(&parallel, "parallel", -1, "parallelization factor")
 	flags.BoolVar(&buildToolchain, "build-toolchain", false, "build toolchain")
 	flags.BoolVar(&verbose, "verbose", false, "verbose")
+	flags.BoolVar(&flagCgo, "cgo", false, "")
+	flags.BoolVar(&flagRebuild, "rebuild", false, "")
+	flags.BoolVar(&flagListOSArch, "osarch-list", false, "")
+	flags.StringVar(&flagGcflags, "gcflags", "", "")
+	flags.StringVar(&flagGoCmd, "gocmd", "go", "")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		flags.Usage()
 		return 1
 	}
 
 	// Determine what amount of parallelism we want Default to the current
-	// number of CPUs is <= 0 is specified.
+	// number of CPUs-1 is <= 0 is specified.
 	if parallel <= 0 {
-		parallel = runtime.NumCPU()
+		cpus := runtime.NumCPU()
+		if cpus < 2 {
+			parallel = 1
+		} else {
+			parallel = cpus - 1
+		}
+
+		// Joyent containers report 48 cores via runtime.NumCPU(), and a
+		// default of 47 parallel builds causes a panic. Default to 3 on
+		// Solaris-derived operating systems unless overridden with the
+		// -parallel flag.
+		if runtime.GOOS == "solaris" {
+			parallel = 3
+		}
 	}
 
 	if buildToolchain {
 		return mainBuildToolchain(parallel, platformFlag, verbose)
 	}
 
-	if _, err := exec.LookPath("go"); err != nil {
-		fmt.Fprintf(os.Stderr, "go executable must be on the PATH\n")
+	if _, err := exec.LookPath(flagGoCmd); err != nil {
+		fmt.Fprintf(os.Stderr, "%s executable must be on the PATH\n",
+			flagGoCmd)
 		return 1
 	}
 
@@ -58,6 +80,10 @@ func realMain() int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error reading Go version: %s", err)
 		return 1
+	}
+
+	if flagListOSArch {
+		return mainListOSArch(version)
 	}
 
 	// Determine the packages that we want to compile. Default to the
@@ -68,7 +94,7 @@ func realMain() int {
 	}
 
 	// Get the packages that are in the given paths
-	mainDirs, err := GoMainDirs(packages)
+	mainDirs, err := GoMainDirs(packages, flagGoCmd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading packages: %s", err)
 		return 1
@@ -80,7 +106,7 @@ func realMain() int {
 		fmt.Println("No valid platforms to build for. If you specified a value")
 		fmt.Println("for the 'os', 'arch', or 'osarch' flags, make sure you're")
 		fmt.Println("using a valid value.")
-		return 0
+		return 1
 	}
 
 	// Build in parallel!
@@ -97,7 +123,24 @@ func realMain() int {
 				defer wg.Done()
 				semaphore <- 1
 				fmt.Printf("--> %15s: %s\n", platform.String(), path)
-				if err := GoCrossCompile(path, platform, outputTpl, ldflags, tags); err != nil {
+
+				opts := &CompileOpts{
+					PackagePath: path,
+					Platform:    platform,
+					OutputTpl:   outputTpl,
+					Ldflags:     ldflags,
+					Tags:        tags,
+					Cgo:         flagCgo,
+					Rebuild:     flagRebuild,
+					GoCmd:       flagGoCmd,
+				}
+
+				// Determine if we have specific CFLAGS or LDFLAGS for this
+				// GOOS/GOARCH combo and override the defaults if so.
+				envOverride(&opts.Ldflags, platform, "LDFLAGS")
+				envOverride(&opts.Gcflags, platform, "GCFLAGS")
+
+				if err := GoCrossCompile(opts); err != nil {
 					errorLock.Lock()
 					defer errorLock.Unlock()
 					errors = append(errors,
@@ -135,12 +178,17 @@ Options:
 
   -arch=""            Space-separated list of architectures to build for
   -build-toolchain    Build cross-compilation toolchain
+  -cgo                Sets CGO_ENABLED=1, requires proper C toolchain (advanced)
+  -gcflags=""         Additional '-gcflags' value to pass to go build
   -ldflags=""         Additional '-ldflags' value to pass to go build
   -tags=""            Additional '-tags' value to pass to go build
   -os=""              Space-separated list of operating systems to build for
   -osarch=""          Space-separated list of os/arch pairs to build for
+  -osarch-list        List supported os/arch pairs for your Go version
   -output="foo"       Output path template. See below for more info
   -parallel=-1        Amount of parallelism, defaults to number of CPUs
+  -gocmd="go"         Build command, defaults to Go
+  -rebuild            Force rebuilding of package that were up to date
   -verbose            Verbose mode
 
 Output path template:
@@ -168,5 +216,14 @@ Platforms (OS/Arch):
   build for a platform. If it is included in the "-osarch" list, it will be
   built even if the specific os and arch is negated in "-os" and "-arch",
   respectively.
+
+Platform Overrides:
+
+  The "-gcflags" and "-ldflags" options can be overridden per-platform
+  by using environment variables. Gox will look for environment variables
+  in the following format and use those to override values if they exist:
+
+    GOX_[OS]_[ARCH]_GCFLAGS
+    GOX_[OS]_[ARCH]_LDFLAGS
 
 `
