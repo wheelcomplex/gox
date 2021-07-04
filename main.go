@@ -6,7 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
+
+	version "github.com/hashicorp/go-version"
 )
 
 func main() {
@@ -23,9 +26,10 @@ func realMain() int {
 	var platformFlag PlatformFlag
 	var tags string
 	var verbose bool
-	var flagGcflags string
-	var flagCgo, flagRebuild, flagListOSArch bool
+	var flagGcflags, flagAsmflags string
+	var flagCgo, flagRebuild, flagListOSArch, flagRaceFlag bool
 	var flagGoCmd string
+	var modMode string
 	flags := flag.NewFlagSet("gox", flag.ExitOnError)
 	flags.Usage = func() { printUsage() }
 	flags.Var(platformFlag.ArchFlagValue(), "arch", "arch to build for or skip")
@@ -40,8 +44,11 @@ func realMain() int {
 	flags.BoolVar(&flagCgo, "cgo", false, "")
 	flags.BoolVar(&flagRebuild, "rebuild", false, "")
 	flags.BoolVar(&flagListOSArch, "osarch-list", false, "")
+	flags.BoolVar(&flagRaceFlag, "race", false, "")
 	flags.StringVar(&flagGcflags, "gcflags", "", "")
+	flags.StringVar(&flagAsmflags, "asmflags", "", "")
 	flags.StringVar(&flagGoCmd, "gocmd", "go", "")
+	flags.StringVar(&modMode, "mod", "", "")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		flags.Usage()
 		return 1
@@ -76,14 +83,14 @@ func realMain() int {
 		return 1
 	}
 
-	version, err := GoVersion()
+	versionStr, err := GoVersion()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error reading Go version: %s", err)
 		return 1
 	}
 
 	if flagListOSArch {
-		return mainListOSArch(version)
+		return mainListOSArch(versionStr)
 	}
 
 	// Determine the packages that we want to compile. Default to the
@@ -101,12 +108,32 @@ func realMain() int {
 	}
 
 	// Determine the platforms we're building for
-	platforms := platformFlag.Platforms(SupportedPlatforms(version))
+	platforms := platformFlag.Platforms(SupportedPlatforms(versionStr))
 	if len(platforms) == 0 {
 		fmt.Println("No valid platforms to build for. If you specified a value")
 		fmt.Println("for the 'os', 'arch', or 'osarch' flags, make sure you're")
 		fmt.Println("using a valid value.")
 		return 1
+	}
+
+	// Assume -mod is supported when no version prefix is found
+	if modMode != "" && strings.HasPrefix(versionStr, "go") {
+		// go-version only cares about version numbers
+		current, err := version.NewVersion(versionStr[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Unable to parse current go version: %s\n%s", versionStr, err.Error())
+			return 1
+		}
+
+		constraint, err := version.NewConstraint(">= 1.11")
+		if err != nil {
+			panic(err)
+		}
+
+		if !constraint.Check(current) {
+			fmt.Printf("Go compiler version %s does not support the -mod flag\n", versionStr)
+			modMode = ""
+		}
 	}
 
 	// Build in parallel!
@@ -129,16 +156,21 @@ func realMain() int {
 					Platform:    platform,
 					OutputTpl:   outputTpl,
 					Ldflags:     ldflags,
+					Gcflags:     flagGcflags,
+					Asmflags:    flagAsmflags,
 					Tags:        tags,
+					ModMode:     modMode,
 					Cgo:         flagCgo,
 					Rebuild:     flagRebuild,
 					GoCmd:       flagGoCmd,
+					Race:        flagRaceFlag,
 				}
 
 				// Determine if we have specific CFLAGS or LDFLAGS for this
 				// GOOS/GOARCH combo and override the defaults if so.
 				envOverride(&opts.Ldflags, platform, "LDFLAGS")
 				envOverride(&opts.Gcflags, platform, "GCFLAGS")
+				envOverride(&opts.Asmflags, platform, "ASMFLAGS")
 
 				if err := GoCrossCompile(opts); err != nil {
 					errorLock.Lock()
@@ -181,12 +213,15 @@ Options:
   -cgo                Sets CGO_ENABLED=1, requires proper C toolchain (advanced)
   -gcflags=""         Additional '-gcflags' value to pass to go build
   -ldflags=""         Additional '-ldflags' value to pass to go build
+  -asmflags=""        Additional '-asmflags' value to pass to go build
   -tags=""            Additional '-tags' value to pass to go build
+  -mod=""             Additional '-mod' value to pass to go build
   -os=""              Space-separated list of operating systems to build for
   -osarch=""          Space-separated list of os/arch pairs to build for
   -osarch-list        List supported os/arch pairs for your Go version
   -output="foo"       Output path template. See below for more info
   -parallel=-1        Amount of parallelism, defaults to number of CPUs
+  -race               Build with the go race detector enabled, requires CGO
   -gocmd="go"         Build command, defaults to Go
   -rebuild            Force rebuilding of package that were up to date
   -verbose            Verbose mode
@@ -219,11 +254,12 @@ Platforms (OS/Arch):
 
 Platform Overrides:
 
-  The "-gcflags" and "-ldflags" options can be overridden per-platform
+  The "-gcflags", "-ldflags" and "-asmflags" options can be overridden per-platform
   by using environment variables. Gox will look for environment variables
   in the following format and use those to override values if they exist:
 
     GOX_[OS]_[ARCH]_GCFLAGS
     GOX_[OS]_[ARCH]_LDFLAGS
+    GOX_[OS]_[ARCH]_ASMFLAGS
 
 `
